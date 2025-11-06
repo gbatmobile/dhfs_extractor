@@ -57,6 +57,8 @@ class DVRExtractor (wx.Frame):
                 bitmap=wx.Bitmap(self.resource_path("icons/info.png")))
         self.ToolBar.AddTool(toolId=104, label="Extract",
                 bitmap=wx.Bitmap(self.resource_path("icons/extract.png")))
+        self.ToolBar.AddTool(toolId=112, label="Extract by Date",
+                bitmap=wx.Bitmap(self.resource_path("icons/extract.png")))
         self.ToolBar.AddTool(toolId=105, label="MetaData",
                 bitmap=wx.Bitmap(self.resource_path("icons/metadata.png")))
         self.ToolBar.AddTool(toolId=106, label="Slack",
@@ -113,6 +115,8 @@ class DVRExtractor (wx.Frame):
             self.show_metadata()
         elif e.GetId() == 104:
             self.save_videos()
+        elif e.GetId() == 112:
+            self.save_videos_by_date()
         elif e.GetId() == 105:
             self.export_videos_metadata()
         elif e.GetId() == 106:
@@ -246,6 +250,61 @@ class DVRExtractor (wx.Frame):
             if tot_videos == 0:
                 wx.MessageBox("Choose one or more videos!!!", version,
                                     style=wx.OK | wx.ICON_INFORMATION)
+
+    def save_videos_by_date(self):
+        if not self.dhfs.img_loaded:
+            wx.MessageBox("No image/disk loaded!!!!!!", "Warning", style=wx.OK)
+            return
+
+        selectedDate = self.lb_dates.GetStringSelection()
+        if not selectedDate or selectedDate == "All":
+            wx.MessageBox("Please select a specific date from the Date list!", version,
+                            style=wx.OK | wx.ICON_INFORMATION)
+            return
+
+        selectedCam = self.lb_cameras.GetStringSelection()
+
+        # Count how many videos match the current filter
+        video_count = 0
+        for part_idx in range(self.dhfs.get_num_partitions()):
+            for desc_idx in self.dhfs.get_main_descs(part_idx):
+                date = self.dhfs.get_begin_date(part_idx, desc_idx)
+                cam = f"{self.dhfs.get_camera(part_idx, desc_idx):02d}"
+                
+                if (date == selectedDate and
+                    ((selectedCam == "All") or (selectedCam == cam))):
+                    video_count += 1
+
+        if video_count == 0:
+            wx.MessageBox("No videos found for the selected date/camera!", version,
+                            style=wx.OK | wx.ICON_INFORMATION)
+            return
+
+        # Confirm with user
+        camera_info = f" from camera {selectedCam}" if selectedCam != "All" else " from all cameras"
+        message = f"Extract {video_count} video(s) from {selectedDate}{camera_info}?"
+        dlg = wx.MessageDialog(self, message, "Confirm Extraction", 
+                               wx.YES_NO | wx.ICON_QUESTION)
+        
+        if dlg.ShowModal() != wx.ID_YES:
+            return
+
+        dir_save = self.get_save_path()
+        if dir_save:
+            tot_videos = 0
+            for part_idx in range(self.dhfs.get_num_partitions()):
+                for desc_idx in self.dhfs.get_main_descs(part_idx):
+                    date = self.dhfs.get_begin_date(part_idx, desc_idx)
+                    cam = f"{self.dhfs.get_camera(part_idx, desc_idx):02d}"
+                    
+                    if (date == selectedDate and
+                        ((selectedCam == "All") or (selectedCam == cam))):
+                        self.dhfs.save_video_at(part_idx, desc_idx, dir_save, self.SetStatusText)
+                        tot_videos += 1
+            
+            self.SetStatusText(f"Done! Extracted {tot_videos} video(s)")
+            wx.MessageBox(f"{tot_videos} video(s) successfully extracted from {selectedDate}!", 
+                         version, style=wx.OK | wx.ICON_INFORMATION)
 
     def export_videos_metadata(self):
         if not self.dhfs.img_loaded:
