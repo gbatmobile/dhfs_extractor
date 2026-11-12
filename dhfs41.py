@@ -40,10 +40,16 @@ class DHFS41:
         return int.from_bytes(desc[20:24], byteorder='little')
 
     def get_last_desc(self, part_idx, desc_idx):
-        nextDesc = self.get_next_desc(part_idx, desc_idx)
-        if nextDesc == 0:
-            return desc_idx
-        return self.get_last_desc(part_idx, nextDesc)
+        # Iterative walk: long chains exceeded Python's recursion limit and
+        # a corrupted chain pointing back to itself never ended.
+        visited = set()
+        while True:
+            visited.add(desc_idx)
+            nextDesc = self.get_next_desc(part_idx, desc_idx)
+            if (nextDesc == 0 or nextDesc == 0xFFFFFFFF or
+                    nextDesc >= self.NUM_FRAGS[part_idx] or nextDesc in visited):
+                return desc_idx
+            desc_idx = nextDesc
 
     def get_num_frags(self, part_idx, desc_idx):
         if self.get_desc_type(part_idx, desc_idx) == 1:
@@ -133,7 +139,10 @@ class DHFS41:
 
         self.num_parts = 0
         blkSize = 512
-        while partInfo[:4] != b"\xAA\x55\xAA\x55":
+        # Stop at end of file, at an empty entry and after the maximum of 16
+        # entries, so a missing or damaged terminator cannot loop forever.
+        while (len(partInfo) == 64 and any(partInfo) and self.num_parts < 16 and
+               partInfo[:4] != b"\xAA\x55\xAA\x55"):
             self.SB_OFFS.append(int.from_bytes(partInfo[20:24],
                                                 byteorder='little') * blkSize)
             self.PART_OFFS.append(int.from_bytes(partInfo[48:56],
@@ -217,7 +226,16 @@ class DHFS41:
         numFrags = self.get_num_frags(part_idx, desc_idx)
 
         idx = 0
-        while desc_idx != 0 and desc_idx != 0xFFFFFFFF:
+        visited = set()
+        # Descriptor 0 is a valid start (the first video of a partition); 0 only
+        # ends the chain as a 'next' value. A corrupted chain may point back to
+        # an earlier descriptor or past the table; stop there instead of
+        # looping forever.
+        first = True
+        while ((first or (desc_idx != 0 and desc_idx != 0xFFFFFFFF)) and
+               desc_idx < self.NUM_FRAGS[part_idx] and desc_idx not in visited):
+            first = False
+            visited.add(desc_idx)
             allFrags.append(desc_idx)
             idx += 1
             desc_idx = self.get_next_desc(part_idx, desc_idx)
@@ -370,7 +388,6 @@ class DHFS41:
             begin    = self.get_begin_time(part_idx, desc_idx)
             end      = self.get_end_time(part_idx, desc_idx)
             cam      = self.get_camera(part_idx, desc_idx)
-            size_last = self.get_camera(part_idx, desc_idx)
             file_name = f"{idx:04d}-Slack-p{part_idx}-{desc_idx:06d}-"
             file_name += f"{date.replace('-','')}-"
             file_name += f"{begin.replace(':','')}-{end.replace(':','')}-"
@@ -417,53 +434,50 @@ class DHFS41:
 
     def save_recovered_at_dirty (self, part_idx, path, log_func):
         tot_videos = 0
-        file_desc = None
+        num_descs = self.NUM_FRAGS[part_idx]
+        # A set keeps membership checks fast on disks with millions of
+        # descriptors; iterating the list directly avoids running past its end
+        # when a chain also contains descriptors that are not in the list.
+        already_saved = set()
 
-        already_saved = []
-        beg_desc  = -1
+        for desc_idx in self.dirty_frags[part_idx]:
+            if desc_idx in already_saved:
+                continue
 
-        tot_dirty_frags = len(self.dirty_frags[part_idx])
-        idx  = 0
+            date     = self.get_begin_date(part_idx, desc_idx)
+            begin    = self.get_begin_time(part_idx, desc_idx)
+            cam      = self.get_camera(part_idx, desc_idx)
+            file_name = f"FragDirty-p{part_idx}-{desc_idx:06d}-{date.replace('-','')}-"
+            file_name += f"{begin.replace(':','')}-"
+            file_name += f"ch{cam:02d}.h264"
+            full_name = path+"/"+file_name
 
-        while len(already_saved) < tot_dirty_frags:
-            if self.dirty_frags[part_idx][idx] not in already_saved:
-                desc_idx = self.dirty_frags[part_idx][idx]
+            file_desc = open(full_name, "wb")
+            if log_func:
+                log_func(f"Saving vídeo {file_name}")
 
-                date     = self.get_begin_date(part_idx, desc_idx)
-                begin    = self.get_begin_time(part_idx, desc_idx)
-                cam      = self.get_camera(part_idx, desc_idx)
-                file_name = f"FragDirty-p{part_idx}-{desc_idx:06d}-{date.replace('-','')}-"
-                file_name += f"{begin.replace(':','')}-"
-                file_name += f"ch{cam:02d}.h264"
-                full_name = path+"/"+file_name
+            file_desc.write(self.read_fragment(part_idx, desc_idx))
+            already_saved.add(desc_idx)
+            nextDesc = self.get_next_desc(part_idx, desc_idx)
+            if self.DEBUG:
+                print (f"part_idx {part_idx} desc_idx {desc_idx} nextDesc {nextDesc}"+
+                       f"baseDesc {self.get_begin_desc(part_idx, desc_idx)} ")
 
-                file_desc = open(full_name, "wb")
-                if log_func:
-                    log_func(f"Saving vídeo {file_name}")
-
+            while (nextDesc != 0 and nextDesc < num_descs and
+                   nextDesc not in already_saved and
+                   self.get_begin_desc(part_idx, desc_idx) ==
+                   self.get_begin_desc(part_idx, nextDesc)):
+                desc_idx = nextDesc
                 file_desc.write(self.read_fragment(part_idx, desc_idx))
-                already_saved.append(desc_idx)
+                already_saved.add(desc_idx)
                 nextDesc = self.get_next_desc(part_idx, desc_idx)
+
                 if self.DEBUG:
                     print (f"part_idx {part_idx} desc_idx {desc_idx} nextDesc {nextDesc}"+
-                           f"baseDesc {self.get_begin_desc(part_idx, desc_idx)} "+
-                           f"baseNext {self.get_begin_desc(part_idx, nextDesc)}")
+                           f"baseDesc {self.get_begin_desc(part_idx, desc_idx)} ")
 
-                while (nextDesc != 0) and (self.get_begin_desc(part_idx, desc_idx) ==
-                                           self.get_begin_desc(part_idx, nextDesc)):
-                    desc_idx = nextDesc
-                    file_desc.write(self.read_fragment(part_idx, desc_idx))
-                    already_saved.append(desc_idx)
-                    nextDesc = self.get_next_desc(part_idx, desc_idx)
-
-                    if self.DEBUG:
-                        print (f"part_idx {part_idx} desc_idx {desc_idx} nextDesc {nextDesc}"+
-                               f"baseDesc {self.get_begin_desc(part_idx, desc_idx)} "+
-                               f"baseNext {self.get_begin_desc(part_idx, nextDesc)}")
-
-                file_desc.close()
-                tot_videos += 1
-            idx += 1
+            file_desc.close()
+            tot_videos += 1
         return tot_videos
 
     def save_recovered_videos(self, part_idx, path, log_func = None):
